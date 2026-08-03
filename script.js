@@ -18,7 +18,7 @@
   // --- Configuration & Persistent State ---
   const CONFIG = {
     CHECK_INTERVAL_MS: 1000,   // Check status every 1 second
-    REDIRECT_DELAY_MS: 300,    // 0.3s delay after sending heal request
+    REDIRECT_DELAY_MS: 0,    // 0.3s delay after sending heal request
     THRESHOLD_SECONDS: 1203,   // 20 minutes and 3 seconds
     MAX_HOSPITAL_SECONDS: 3600 // 1 hour
   };
