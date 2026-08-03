@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer & Attack Redirect
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Automates medical item healing, auto Xanax (default ON), max runs (default 13), item counts, and forces page reloads.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/*
 // @match        https://www.torn.com/item.php*
+// @updateURL    https://raw.githubusercontent.com/cykorr/script/main/script.js
+// @downloadURL  https://raw.githubusercontent.com/cykorr/script/main/script.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_setClipboard
@@ -17,8 +19,8 @@
 
   // --- Configuration & Persistent State ---
   const CONFIG = {
-    CHECK_INTERVAL_MS: 1000,   // Check status every 1 second
-    REDIRECT_DELAY_MS: 0,    // 0.3s delay after sending heal request
+    CHECK_INTERVAL_MS: 500,   // Check status every 0.5 second
+    REDIRECT_DELAY_MS: 0,    // 0 delay after sending heal request
     THRESHOLD_SECONDS: 1203,   // 20 minutes and 3 seconds
     MAX_HOSPITAL_SECONDS: 3600 // 1 hour
   };
