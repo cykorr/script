@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer & Attack Redirect
 // @namespace    http://tampermonkey.net/
-// @version      2.1
-// @description  Automates medical item healing, auto Xanax, shows item counts, runs on items page, and forces redirect 0.3s post-heal on attack page.
+// @version      2.3
+// @description  Automates medical item healing, auto Xanax (default ON), max runs (default 13), item counts, and forces page reloads.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/*
 // @match        https://www.torn.com/item.php*
@@ -25,8 +25,8 @@
 
   let state = {
     active: GM_getValue('autoHeal_active', false),
-    useXanax: GM_getValue('autoHeal_useXanax', false),
-    targetCount: GM_getValue('autoHeal_targetCount', 5),
+    useXanax: GM_getValue('autoHeal_useXanax', true),       // Default: ON
+    targetCount: GM_getValue('autoHeal_targetCount', 13),   // Default: 13 runs
     completedCount: GM_getValue('autoHeal_completedCount', 0),
     wasInHospital: GM_getValue('autoHeal_wasInHospital', false),
     isProcessing: false,
@@ -37,6 +37,23 @@
   // Helper: Check if current page is an attack loader page
   function isCurrentlyOnAttackPage() {
     return window.location.href.includes('sid=attack') || window.location.href.includes('loader.php?sid=attack');
+  }
+
+  // Helper: Force reload attack loader screen
+  function forceAttackPageRefresh() {
+    // 1. Try finding and clicking Torn's native refresh/again button on attack loader
+    const attackAgainBtn = document.querySelector('a[href*="sid=attack"], button[class*="attack"], [data-action="reload"], .title-black___x_34s button');
+    if (attackAgainBtn && typeof attackAgainBtn.click === 'function') {
+      console.log('🚀 Triggering Torn native UI attack refresh button...');
+      attackAgainBtn.click();
+      return;
+    }
+
+    // 2. Cache-busting hard reload (Appends timestamp to URL to force React re-render)
+    const currentUrl = new URL(window.location.href);
+    currentUrl.searchParams.set('_t', Date.now()); // Add unique timestamp parameter
+    console.log(`🚀 Performing hard cache-busting redirect to: ${currentUrl.toString()}`);
+    window.location.href = currentUrl.toString();
   }
 
   // Helper: Extract cookie values
@@ -244,10 +261,9 @@
 
         // ONLY refresh if currently on an attack page
         if (isCurrentlyOnAttackPage()) {
-          updateStatus(`Healed! Redirecting in 0.3s...`);
+          updateStatus(`Healed! Triggering refresh in 0.3s...`);
           setTimeout(() => {
-            console.log(`🚀 Forcing hard URL reload...`);
-            window.location.replace(window.location.href); // Force location replacement
+            forceAttackPageRefresh();
           }, CONFIG.REDIRECT_DELAY_MS);
         } else {
           updateStatus(`Healed! (${state.completedCount}/${state.targetCount}) - Not on attack loader`);
