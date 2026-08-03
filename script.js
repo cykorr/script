@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Torn - Auto Medical Item Healer & Attack Redirect
+// @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      2.5
-// @description  Automates medical item healing, auto Xanax (default ON), max runs (default 13), item counts, and forces page reloads.
+// @version      2.6
+// @description  Automates medical item healing, auto Xanax (default ON), max runs (default 13), and shows item counts.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/*
 // @match        https://www.torn.com/item.php*
@@ -20,7 +20,6 @@
   // --- Configuration & Persistent State ---
   const CONFIG = {
     CHECK_INTERVAL_MS: 500,   // Check status every 0.5 second
-    REDIRECT_DELAY_MS: 0,    // 0 delay after sending heal request
     THRESHOLD_SECONDS: 1203,   // 20 minutes and 3 seconds
     MAX_HOSPITAL_SECONDS: 3600 // 1 hour
   };
@@ -35,28 +34,6 @@
     posX: GM_getValue('autoHeal_posX', null),
     posY: GM_getValue('autoHeal_posY', null)
   };
-
-  // Helper: Check if current page is an attack loader page
-  function isCurrentlyOnAttackPage() {
-    return window.location.href.includes('sid=attack') || window.location.href.includes('loader.php?sid=attack');
-  }
-
-  // Helper: Force reload attack loader screen
-  function forceAttackPageRefresh() {
-    // 1. Try finding and clicking Torn's native refresh/again button on attack loader
-    const attackAgainBtn = document.querySelector('a[href*="sid=attack"], button[class*="attack"], [data-action="reload"], .title-black___x_34s button');
-    if (attackAgainBtn && typeof attackAgainBtn.click === 'function') {
-      console.log('🚀 Triggering Torn native UI attack refresh button...');
-      attackAgainBtn.click();
-      return;
-    }
-
-    // 2. Cache-busting hard reload (Appends timestamp to URL to force React re-render)
-    const currentUrl = new URL(window.location.href);
-    currentUrl.searchParams.set('_t', Date.now()); // Add unique timestamp parameter
-    console.log(`🚀 Performing hard cache-busting redirect to: ${currentUrl.toString()}`);
-    window.location.href = currentUrl.toString();
-  }
 
   // Helper: Extract cookie values
   const getCookie = (name) =>
@@ -251,7 +228,7 @@
 
     updateStatus(`Healing with ${itemName}...`);
 
-    // 5. Send POST Request & Refresh
+    // 5. Send POST Request
     try {
       const data = await useItemRequest(itemId, rfcToken);
 
@@ -260,17 +237,8 @@
         GM_setValue('autoHeal_completedCount', state.completedCount);
         console.log(`✅ Auto-Healer: Used ${itemName}. Total runs: ${state.completedCount}/${state.targetCount}`);
         fetchItemCounts();
-
-        // ONLY refresh if currently on an attack page
-        if (isCurrentlyOnAttackPage()) {
-          updateStatus(`Healed! Triggering refresh in 0.3s...`);
-          setTimeout(() => {
-            forceAttackPageRefresh();
-          }, CONFIG.REDIRECT_DELAY_MS);
-        } else {
-          updateStatus(`Healed! (${state.completedCount}/${state.targetCount}) - Not on attack loader`);
-          setTimeout(() => { state.isProcessing = false; }, 500);
-        }
+        updateStatus(`Healed! (${state.completedCount}/${state.targetCount})`);
+        setTimeout(() => { state.isProcessing = false; }, 500);
       } else {
         updateStatus(`Failed: ${data.text || 'Server error'}`);
         setTimeout(() => { state.isProcessing = false; }, 1500);
