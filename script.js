@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      2.6
-// @description  Automates medical item healing, auto Xanax (default ON), max runs (default 13), and shows item counts.
+// @version      2.7
+// @description  Automates medical item healing, auto Xanax (default ON), max runs (default 13), item counts via API key support.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/*
 // @match        https://www.torn.com/item.php*
@@ -19,7 +19,7 @@
 
   // --- Configuration & Persistent State ---
   const CONFIG = {
-    CHECK_INTERVAL_MS: 500,   // Check status every 0.5 second
+    CHECK_INTERVAL_MS: 500,   // Check status every 1 second
     THRESHOLD_SECONDS: 1203,   // 20 minutes and 3 seconds
     MAX_HOSPITAL_SECONDS: 3600 // 1 hour
   };
@@ -28,6 +28,7 @@
     active: GM_getValue('autoHeal_active', false),
     useXanax: GM_getValue('autoHeal_useXanax', true),       // Default: ON
     targetCount: GM_getValue('autoHeal_targetCount', 13),   // Default: 13 runs
+    apiKey: GM_getValue('autoHeal_apiKey', ''),             // Torn API Key
     completedCount: GM_getValue('autoHeal_completedCount', 0),
     wasInHospital: GM_getValue('autoHeal_wasInHospital', false),
     isProcessing: false,
@@ -83,38 +84,64 @@
     return await response.json();
   }
 
-  // Helper: Fetch Inventory item amounts
+  // Helper: Fetch Inventory item amounts via Torn API or local fallback
   async function fetchItemCounts() {
     let smallAid = 0, firstAid = 0, xanax = 0;
     let found = false;
 
-    try {
-      const rfcToken = getCookie('rfc_v') || getCookie('rfc_id');
-      const response = await fetch(`/item.php?rfcv=${rfcToken}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest'
-        },
-        body: new URLSearchParams({ step: 'getInventoryData' })
-      });
-      const data = await response.json();
-      
-      const items = data?.inventory || data?.items || data;
-      if (items && typeof items === 'object') {
-        Object.values(items).forEach(item => {
-          const id = parseInt(item.ID || item.itemID || item.id, 10);
-          const qty = parseInt(item.qty || item.quantity || item.amount || 1, 10);
-          if (id === 67) smallAid += qty;
-          if (id === 68) firstAid += qty;
-          if (id === 206) xanax += qty;
-        });
-        found = true;
+    // 1. Try fetching via Torn API key if available
+    if (state.apiKey) {
+      try {
+        const apiRes = await fetch(`https://api.torn.com/user/?selections=inventory&key=${state.apiKey}`);
+        const apiData = await apiRes.json();
+
+        if (apiData && apiData.inventory) {
+          const items = Array.isArray(apiData.inventory) ? apiData.inventory : Object.values(apiData.inventory);
+          items.forEach(item => {
+            const id = parseInt(item.ID || item.id, 10);
+            const qty = parseInt(item.quantity || item.qty || 1, 10);
+            if (id === 67) smallAid += qty;
+            if (id === 68) firstAid += qty;
+            if (id === 206) xanax += qty;
+          });
+          found = true;
+        }
+      } catch (err) {
+        console.error('❌ Auto-Healer API Error:', err);
       }
-    } catch (e) {
-      // Fall through to DOM scan
     }
 
+    // 2. Fallback: Query local item endpoint
+    if (!found) {
+      try {
+        const rfcToken = getCookie('rfc_v') || getCookie('rfc_id');
+        const response = await fetch(`/item.php?rfcv=${rfcToken}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest'
+          },
+          body: new URLSearchParams({ step: 'getInventoryData' })
+        });
+        const data = await response.json();
+        
+        const items = data?.inventory || data?.items || data;
+        if (items && typeof items === 'object') {
+          Object.values(items).forEach(item => {
+            const id = parseInt(item.ID || item.itemID || item.id, 10);
+            const qty = parseInt(item.qty || item.quantity || item.amount || 1, 10);
+            if (id === 67) smallAid += qty;
+            if (id === 68) firstAid += qty;
+            if (id === 206) xanax += qty;
+          });
+          found = true;
+        }
+      } catch (e) {
+        // Fall through to DOM scan
+      }
+    }
+
+    // 3. Fallback: Scan DOM directly
     if (!found) {
       document.querySelectorAll('[data-item], .item-hoolder, [class*="item_"]').forEach(el => {
         const text = el.textContent || '';
@@ -274,6 +301,12 @@
     updateUI();
   }
 
+  function setApiKey(val) {
+    state.apiKey = val.trim();
+    GM_setValue('autoHeal_apiKey', state.apiKey);
+    fetchItemCounts();
+  }
+
   // --- Inject UI Controls ---
   function createUI() {
     if (document.getElementById('auto-heal-widget')) return;
@@ -315,6 +348,12 @@
                  style="width: 75px; background: #111; color: #4caf50; font-weight: bold; border: 1px solid #555; border-radius: 4px; text-align: center; padding: 2px; cursor: text;">
           <button id="auto-heal-copy-id-btn" style="background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 2px 6px; font-size: 11px; cursor: pointer;">Copy</button>
         </div>
+      </div>
+
+      <div style="margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between;">
+        <label for="auto-heal-api-key" style="font-size: 11px; color: #ccc;">API Key:</label>
+        <input type="password" id="auto-heal-api-key" value="${state.apiKey}" placeholder="Torn API Key"
+               style="width: 120px; background: #111; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 2px 4px; font-size: 11px;">
       </div>
 
       <div style="background: #181818; border: 1px solid #333; border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; font-size: 11px;">
@@ -377,6 +416,10 @@
 
     document.getElementById('auto-heal-target').addEventListener('change', (e) => {
       setTargetCount(e.target.value);
+    });
+
+    document.getElementById('auto-heal-api-key').addEventListener('change', (e) => {
+      setApiKey(e.target.value);
     });
 
     const copyBtn = document.getElementById('auto-heal-copy-id-btn');
