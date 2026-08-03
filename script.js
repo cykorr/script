@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer & Attack Redirect
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  Automates medical item healing, auto Xanax (default ON), max runs (default 13), item counts, and forces page reloads.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/*
