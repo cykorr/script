@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  Automates medical item healing, auto Xanax, dual-interval DOM/API tracking, and built-in debug panel.
+// @version      3.1-DEBUG
+// @description  Automates medical item healing, auto Xanax, dual-interval tracking, debug log, and resilient API parsing.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/*
 // @match        https://www.torn.com/item.php*
@@ -164,13 +164,28 @@
           
           debugLog(`API response contained ${itemsList.length} total inventory objects.`, 'info');
 
+          // Log item structure for debugging if items exist
+          if (itemsList.length > 0) {
+            const firstItem = itemsList[0];
+            const sampleKeys = Object.keys(firstItem).join(', ');
+            debugLog(`Sample Item Keys: [${sampleKeys}]`, 'info');
+          }
+
           itemsList.forEach(item => {
-            const id = parseInt(item.ID || item.id || item.item_id || item.itemID, 10);
-            const qty = parseInt(item.quantity || item.qty || item.amount || 1, 10);
+            if (!item || typeof item !== 'object') return;
+
+            const id = parseInt(item.ID ?? item.id ?? item.item_id ?? item.itemID ?? 0, 10);
+            const name = String(item.name ?? item.title ?? '').trim().toLowerCase();
+            const qty = parseInt(item.quantity ?? item.qty ?? item.amount ?? item.count ?? 1, 10);
             
-            if (id === 67) smallAid += qty;
-            if (id === 68) firstAid += qty;
-            if (id === 206) xanax += qty;
+            // Check by ID or Name
+            if (id === 67 || name === 'small first aid kit') {
+              smallAid += qty;
+            } else if (id === 68 || name === 'first aid kit') {
+              firstAid += qty;
+            } else if (id === 206 || name === 'xanax') {
+              xanax += qty;
+            }
           });
 
           found = true;
@@ -204,11 +219,14 @@
         if (rawItems && typeof rawItems === 'object') {
           const itemsList = Array.isArray(rawItems) ? rawItems : Object.values(rawItems);
           itemsList.forEach(item => {
-            const id = parseInt(item.ID || item.itemID || item.id, 10);
-            const qty = parseInt(item.qty || item.quantity || item.amount || 1, 10);
-            if (id === 67) smallAid += qty;
-            if (id === 68) firstAid += qty;
-            if (id === 206) xanax += qty;
+            if (!item || typeof item !== 'object') return;
+            const id = parseInt(item.ID ?? item.itemID ?? item.id ?? 0, 10);
+            const name = String(item.name ?? '').trim().toLowerCase();
+            const qty = parseInt(item.qty ?? item.quantity ?? item.amount ?? 1, 10);
+
+            if (id === 67 || name === 'small first aid kit') smallAid += qty;
+            else if (id === 68 || name === 'first aid kit') firstAid += qty;
+            else if (id === 206 || name === 'xanax') xanax += qty;
           });
           found = true;
           debugLog(`Local Endpoint Counts -> S:${smallAid} | F:${firstAid} | X:${xanax}`, 'success');
@@ -626,7 +644,7 @@
   // --- Initialization ---
   function init() {
     createUI();
-    debugLog('Auto-Healer Script Loaded (v3.0)', 'info');
+    debugLog('Auto-Healer Loaded (v3.1 - Resilient API Parsing)', 'info');
     setInterval(checkAndHeal, CONFIG.DOM_CHECK_INTERVAL_MS);
     setInterval(() => fetchItemCounts(), CONFIG.API_CHECK_INTERVAL_MS);
   }
