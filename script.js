@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      2.7
-// @description  Automates medical item healing, auto Xanax (default ON), max runs (default 13), item counts via API key support.
+// @version      2.9
+// @description  Automates medical item healing, auto Xanax (default ON), max runs (default 13), dual-interval DOM/API tracking.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/*
 // @match        https://www.torn.com/item.php*
@@ -11,6 +11,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
 // @run-at       document-end
 // ==/UserScript==
 
@@ -19,9 +20,11 @@
 
   // --- Configuration & Persistent State ---
   const CONFIG = {
-    CHECK_INTERVAL_MS: 500,   // Check status every 1 second
-    THRESHOLD_SECONDS: 1203,   // 20 minutes and 3 seconds
-    MAX_HOSPITAL_SECONDS: 3600 // 1 hour
+    DOM_CHECK_INTERVAL_MS: 500,  // Check status & hospital timer every 0.5 seconds
+    API_CHECK_INTERVAL_MS: 5000,  // Fetch inventory API every 5 seconds
+    CACHE_TTL_MS: 30000,        // Cache fallback TTL: 30 seconds
+    THRESHOLD_SECONDS: 1203,    // 20 minutes and 3 seconds
+    MAX_HOSPITAL_SECONDS: 3600  // 1 hour
   };
 
   let state = {
@@ -34,6 +37,14 @@
     isProcessing: false,
     posX: GM_getValue('autoHeal_posX', null),
     posY: GM_getValue('autoHeal_posY', null)
+  };
+
+  // Inventory Cache Store
+  let inventoryCache = {
+    lastFetch: 0,
+    smallAid: 0,
+    firstAid: 0,
+    xanax: 0
   };
 
   // Helper: Extract cookie values
@@ -84,22 +95,53 @@
     return await response.json();
   }
 
-  // Helper: Fetch Inventory item amounts via Torn API or local fallback
-  async function fetchItemCounts() {
+  // Helper: GM_xmlhttpRequest Promise Wrapper
+  function fetchApiGM(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: url,
+        onload: (res) => {
+          try {
+            resolve(JSON.parse(res.responseText));
+          } catch (e) {
+            reject(e);
+          }
+        },
+        onerror: (err) => reject(err)
+      });
+    });
+  }
+
+  // Helper: Fetch Inventory item amounts
+  async function fetchItemCounts(forceRefresh = false) {
+    const now = Date.now();
+
+    // Skip if not forced and standard timer hasn't elapsed relative to last fetch
+    if (!forceRefresh && (now - inventoryCache.lastFetch < CONFIG.API_CHECK_INTERVAL_MS)) {
+      updateDashboardCounts(inventoryCache.smallAid, inventoryCache.firstAid, inventoryCache.xanax);
+      return;
+    }
+
     let smallAid = 0, firstAid = 0, xanax = 0;
     let found = false;
 
-    // 1. Try fetching via Torn API key if available
+    // 1. Fetch via API Key if set
     if (state.apiKey) {
       try {
-        const apiRes = await fetch(`https://api.torn.com/user/?selections=inventory&key=${state.apiKey}`);
-        const apiData = await apiRes.json();
+        const apiData = await fetchApiGM(`https://api.torn.com/user/?selections=inventory&key=${state.apiKey}`);
 
-        if (apiData && apiData.inventory) {
-          const items = Array.isArray(apiData.inventory) ? apiData.inventory : Object.values(apiData.inventory);
-          items.forEach(item => {
-            const id = parseInt(item.ID || item.id, 10);
-            const qty = parseInt(item.quantity || item.qty || 1, 10);
+        if (apiData.error) {
+          console.error('❌ Torn API Error:', apiData.error);
+          updateStatus(`API Error: ${apiData.error.error}`);
+        } else if (apiData && apiData.inventory) {
+          const rawItems = apiData.inventory;
+          const itemsList = Array.isArray(rawItems) ? rawItems : Object.values(rawItems);
+          
+          itemsList.forEach(item => {
+            const id = parseInt(item.ID || item.id || item.item_id || item.itemID, 10);
+            const qty = parseInt(item.quantity || item.qty || item.amount || 1, 10);
+            
             if (id === 67) smallAid += qty;
             if (id === 68) firstAid += qty;
             if (id === 206) xanax += qty;
@@ -107,7 +149,7 @@
           found = true;
         }
       } catch (err) {
-        console.error('❌ Auto-Healer API Error:', err);
+        console.error('❌ Auto-Healer API Network/CORS Error:', err);
       }
     }
 
@@ -125,9 +167,10 @@
         });
         const data = await response.json();
         
-        const items = data?.inventory || data?.items || data;
-        if (items && typeof items === 'object') {
-          Object.values(items).forEach(item => {
+        const rawItems = data?.inventory || data?.items || data;
+        if (rawItems && typeof rawItems === 'object') {
+          const itemsList = Array.isArray(rawItems) ? rawItems : Object.values(rawItems);
+          itemsList.forEach(item => {
             const id = parseInt(item.ID || item.itemID || item.id, 10);
             const qty = parseInt(item.qty || item.quantity || item.amount || 1, 10);
             if (id === 67) smallAid += qty;
@@ -150,6 +193,14 @@
         if (text.includes('Xanax')) xanax++;
       });
     }
+
+    // Save to Cache
+    inventoryCache = {
+      lastFetch: now,
+      smallAid: smallAid,
+      firstAid: firstAid,
+      xanax: xanax
+    };
 
     updateDashboardCounts(smallAid, firstAid, xanax);
   }
@@ -176,7 +227,7 @@
       return;
     }
 
-    // 1. Locate Hospital Status Link
+    // 1. Locate Hospital Status Link via DOM (Runs at 0.5s interval)
     const hospLink = document.querySelector('a[aria-label^="Hospital:"]') ||
                      document.querySelector('a[aria-label*="Hospital"]') ||
                      document.querySelector('a[href*="hospital"]');
@@ -235,7 +286,7 @@
         if (xanaxData.success) {
           console.log('✅ Auto-Healer: Used Xanax.');
           updateStatus('Used Xanax successfully!');
-          fetchItemCounts();
+          fetchItemCounts(true); // Force immediate inventory update after using item
           setTimeout(() => { state.isProcessing = false; }, 500);
         } else {
           updateStatus(`Xanax Failed: ${xanaxData.text || 'Server error'}`);
@@ -263,7 +314,7 @@
         state.completedCount += 1;
         GM_setValue('autoHeal_completedCount', state.completedCount);
         console.log(`✅ Auto-Healer: Used ${itemName}. Total runs: ${state.completedCount}/${state.targetCount}`);
-        fetchItemCounts();
+        fetchItemCounts(true); // Force immediate inventory update after healing
         updateStatus(`Healed! (${state.completedCount}/${state.targetCount})`);
         setTimeout(() => { state.isProcessing = false; }, 500);
       } else {
@@ -304,7 +355,7 @@
   function setApiKey(val) {
     state.apiKey = val.trim();
     GM_setValue('autoHeal_apiKey', state.apiKey);
-    fetchItemCounts();
+    fetchItemCounts(true);
   }
 
   // --- Inject UI Controls ---
@@ -437,7 +488,7 @@
     });
 
     updateUI();
-    fetchItemCounts();
+    fetchItemCounts(true);
   }
 
   // --- Drag and Drop Functionality ---
@@ -512,7 +563,10 @@
   // --- Initialization ---
   function init() {
     createUI();
-    setInterval(checkAndHeal, CONFIG.CHECK_INTERVAL_MS);
+    // Loop 1: Fast DOM scraping / check timer (every 0.5 seconds)
+    setInterval(checkAndHeal, CONFIG.DOM_CHECK_INTERVAL_MS);
+    // Loop 2: Background API inventory synchronization (every 5 seconds)
+    setInterval(() => fetchItemCounts(), CONFIG.API_CHECK_INTERVAL_MS);
   }
 
   if (document.body) {
