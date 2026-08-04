@@ -1,16 +1,13 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      3.1-DEBUG
-// @description  Automates medical item healing, auto Xanax, dual-interval tracking, debug log, and resilient API parsing.
+// @version      4.1
+// @description  Automated hospital healer and Xanax manager using Torn API v2.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/*
 // @match        https://www.torn.com/item.php*
-// @updateURL    https://raw.githubusercontent.com/cykorr/script/main/script.js
-// @downloadURL  https://raw.githubusercontent.com/cykorr/script/main/script.js
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @grant        GM_setClipboard
 // @grant        GM_xmlhttpRequest
 // @run-at       document-end
 // ==/UserScript==
@@ -18,264 +15,114 @@
 (function () {
   'use strict';
 
-  // --- Configuration & Persistent State ---
   const CONFIG = {
-    DOM_CHECK_INTERVAL_MS: 500,   // Check status & hospital timer every 0.5 seconds
-    API_CHECK_INTERVAL_MS: 5000,  // Fetch inventory API every 5 seconds
-    THRESHOLD_SECONDS: 1203,     // 20 minutes and 3 seconds
-    MAX_HOSPITAL_SECONDS: 3600   // 1 hour
+    DOM_CHECK_INTERVAL_MS: 500,
+    API_CHECK_INTERVAL_MS: 5000,
+    THRESHOLD_SECONDS: 1203,
+    MAX_HOSPITAL_SECONDS: 3600
   };
 
   let state = {
     active: GM_getValue('autoHeal_active', false),
-    useXanax: GM_getValue('autoHeal_useXanax', true),       // Default: ON
-    targetCount: GM_getValue('autoHeal_targetCount', 13),   // Default: 13 runs
-    apiKey: GM_getValue('autoHeal_apiKey', ''),             // Torn API Key
+    useXanax: GM_getValue('autoHeal_useXanax', true),
+    targetCount: GM_getValue('autoHeal_targetCount', 13),
+    apiKey: GM_getValue('autoHeal_apiKey', ''),
     completedCount: GM_getValue('autoHeal_completedCount', 0),
-    wasInHospital: GM_getValue('autoHeal_wasInHospital', false),
     isProcessing: false,
     posX: GM_getValue('autoHeal_posX', null),
     posY: GM_getValue('autoHeal_posY', null)
   };
 
-  // Inventory Cache Store
-  let inventoryCache = {
-    lastFetch: 0,
-    smallAid: 0,
-    firstAid: 0,
-    xanax: 0
-  };
+  let inventoryCache = { lastFetch: 0, smallAid: 0, firstAid: 0, xanax: 0 };
 
-  // --- Debug Logging Utility ---
-  function debugLog(msg, type = 'info') {
-    const logBox = document.getElementById('auto-heal-debug-logs');
-    const colorMap = {
-      info: '#ccc',
-      success: '#4caf50',
-      warn: '#ff9800',
-      error: '#f44336'
-    };
-    const time = new Date().toLocaleTimeString();
-    const formattedMsg = `[${time}] ${msg}`;
-
-    console.log(`[AutoHealer Debug] ${msg}`);
-
-    if (logBox) {
-      const line = document.createElement('div');
-      line.style.color = colorMap[type] || '#ccc';
-      line.style.borderBottom = '1px solid #222';
-      line.style.padding = '1px 0';
-      line.innerText = formattedMsg;
-      logBox.appendChild(line);
-      logBox.scrollTop = logBox.scrollHeight;
-    }
-  }
-
-  // Helper: Extract cookie values
   const getCookie = (name) =>
     document.cookie.split('; ').find(row => row.startsWith(`${name}=`))?.split('=')[1];
 
-  // Helper: Extract player's own ID from cookies or DOM
   function getMyPlayerId() {
-    const uidCookie = getCookie('uid') || getCookie('user');
-    if (uidCookie && /^\d+$/.test(uidCookie)) return uidCookie;
-
-    const userProfileLink = document.querySelector('a[href*="profiles.php?XID="]');
-    if (userProfileLink) {
-      const match = userProfileLink.href.match(/XID=(\d+)/);
-      if (match) return match[1];
-    }
-    return 'Unknown';
+    const uid = getCookie('uid') || getCookie('user');
+    if (uid && /^\d+$/.test(uid)) return uid;
+    const link = document.querySelector('a[href*="profiles.php?XID="]');
+    return link ? link.href.match(/XID=(\d+)/)?.[1] || 'Unknown' : 'Unknown';
   }
 
-  // Helper: Get energy value from topbar UI
   function getCurrentEnergy() {
-    const energyElem = document.querySelector('#user-bar #energyval') || 
-                       document.querySelector('[class*="energy"] [class*="value"]') ||
-                       document.querySelector('#barEnergy .val');
-    if (energyElem) {
-      const match = energyElem.textContent.match(/\d+/);
-      return match ? parseInt(match[0], 10) : null;
-    }
-    return null;
+    const elem = document.querySelector('#user-bar #energyval') || 
+                 document.querySelector('[class*="energy"] [class*="value"]') ||
+                 document.querySelector('#barEnergy .val');
+    return elem ? parseInt(elem.textContent.match(/\d+/)?.[0] || 0, 10) : null;
   }
 
-  // Helper: Fast fetch wrapper for item requests
   async function useItemRequest(itemId, rfcToken) {
-    const body = new URLSearchParams();
-    body.set('step', 'useItem');
-    body.set('id', itemId);
-    body.set('itemID', itemId);
-
-    const response = await fetch(`/item.php?rfcv=${rfcToken}`, {
+    const body = new URLSearchParams({ step: 'useItem', id: itemId, itemID: itemId });
+    const res = await fetch(`/item.php?rfcv=${rfcToken}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-        'X-Requested-With': 'XMLHttpRequest'
-      },
-      body: body
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest' },
+      body
     });
-
-    return await response.json();
+    return res.json();
   }
 
-  // Helper: GM_xmlhttpRequest Promise Wrapper
   function fetchApiGM(url) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'GET',
-        url: url,
+        url,
         onload: (res) => {
-          try {
-            resolve(JSON.parse(res.responseText));
-          } catch (e) {
-            reject(`JSON Parse Error: ${res.responseText.slice(0, 100)}...`);
-          }
+          try { resolve(JSON.parse(res.responseText)); } 
+          catch (e) { reject(e); }
         },
-        onerror: (err) => reject(`Network Request Error`)
+        onerror: reject
       });
     });
   }
 
-  // Helper: Fetch Inventory item amounts
   async function fetchItemCounts(forceRefresh = false) {
     const now = Date.now();
+    if (!forceRefresh && (now - inventoryCache.lastFetch < CONFIG.API_CHECK_INTERVAL_MS)) return;
+    if (!state.apiKey) return;
 
-    if (!forceRefresh && (now - inventoryCache.lastFetch < CONFIG.API_CHECK_INTERVAL_MS)) {
-      updateDashboardCounts(inventoryCache.smallAid, inventoryCache.firstAid, inventoryCache.xanax);
-      return;
-    }
-
-    let smallAid = 0, firstAid = 0, xanax = 0;
-    let found = false;
-
-    // 1. Fetch via API Key if set
-    if (state.apiKey) {
-      debugLog(`Querying Torn API with key...`);
-      try {
-        const apiData = await fetchApiGM(`https://api.torn.com/user/?selections=inventory&key=${state.apiKey}`);
-
-        if (apiData.error) {
-          debugLog(`API Error Code ${apiData.error.code}: ${apiData.error.error}`, 'error');
-          updateStatus(`API Error: ${apiData.error.error}`);
-        } else if (apiData && apiData.inventory) {
-          const rawItems = apiData.inventory;
-          const itemsList = Array.isArray(rawItems) ? rawItems : Object.values(rawItems);
-          
-          debugLog(`API response contained ${itemsList.length} total inventory objects.`, 'info');
-
-          // Log item structure for debugging if items exist
-          if (itemsList.length > 0) {
-            const firstItem = itemsList[0];
-            const sampleKeys = Object.keys(firstItem).join(', ');
-            debugLog(`Sample Item Keys: [${sampleKeys}]`, 'info');
-          }
-
-          itemsList.forEach(item => {
-            if (!item || typeof item !== 'object') return;
-
-            const id = parseInt(item.ID ?? item.id ?? item.item_id ?? item.itemID ?? 0, 10);
-            const name = String(item.name ?? item.title ?? '').trim().toLowerCase();
-            const qty = parseInt(item.quantity ?? item.qty ?? item.amount ?? item.count ?? 1, 10);
-            
-            // Check by ID or Name
-            if (id === 67 || name === 'small first aid kit') {
-              smallAid += qty;
-            } else if (id === 68 || name === 'first aid kit') {
-              firstAid += qty;
-            } else if (id === 206 || name === 'xanax') {
-              xanax += qty;
-            }
-          });
-
-          found = true;
-          debugLog(`Parsed Counts -> S:${smallAid} | F:${firstAid} | X:${xanax}`, 'success');
-        } else {
-          debugLog(`API response missing 'inventory' key. Keys found: ${Object.keys(apiData).join(', ')}`, 'warn');
-        }
-      } catch (err) {
-        debugLog(`API Request Failed: ${err}`, 'error');
+    try {
+      // API v2 Inventory call
+      const data = await fetchApiGM(`https://api.torn.com/v2/user/inventory?key=${state.apiKey}`);
+      
+      if (data.error) {
+        updateStatus(`API Error: ${data.error.error || data.error.code}`);
+        return;
       }
-    } else {
-      debugLog('No API key entered. Skipping API fetch.', 'warn');
-    }
 
-    // 2. Fallback: Local item endpoint
-    if (!found) {
-      debugLog('Attempting fallback: Local item endpoint...');
-      try {
-        const rfcToken = getCookie('rfc_v') || getCookie('rfc_id');
-        const response = await fetch(`/item.php?rfcv=${rfcToken}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-            'X-Requested-With': 'XMLHttpRequest'
-          },
-          body: new URLSearchParams({ step: 'getInventoryData' })
-        });
-        const data = await response.json();
-        
-        const rawItems = data?.inventory || data?.items || data;
-        if (rawItems && typeof rawItems === 'object') {
-          const itemsList = Array.isArray(rawItems) ? rawItems : Object.values(rawItems);
-          itemsList.forEach(item => {
-            if (!item || typeof item !== 'object') return;
-            const id = parseInt(item.ID ?? item.itemID ?? item.id ?? 0, 10);
-            const name = String(item.name ?? '').trim().toLowerCase();
-            const qty = parseInt(item.qty ?? item.quantity ?? item.amount ?? 1, 10);
+      let smallAid = 0, firstAid = 0, xanax = 0;
+      const items = data?.inventory?.items || [];
 
-            if (id === 67 || name === 'small first aid kit') smallAid += qty;
-            else if (id === 68 || name === 'first aid kit') firstAid += qty;
-            else if (id === 206 || name === 'xanax') xanax += qty;
-          });
-          found = true;
-          debugLog(`Local Endpoint Counts -> S:${smallAid} | F:${firstAid} | X:${xanax}`, 'success');
-        }
-      } catch (e) {
-        debugLog('Local item endpoint failed or not on item page.', 'warn');
-      }
-    }
+      items.forEach(item => {
+        const id = parseInt(item.id, 10);
+        const qty = parseInt(item.amount || 0, 10);
 
-    // 3. Fallback: Scan DOM directly
-    if (!found) {
-      debugLog('Attempting fallback: DOM Scan...');
-      document.querySelectorAll('[data-item], .item-hoolder, [class*="item_"]').forEach(el => {
-        const text = el.textContent || '';
-        if (text.includes('Small First Aid Kit')) smallAid++;
-        if (text.includes('First Aid Kit') && !text.includes('Small')) firstAid++;
-        if (text.includes('Xanax')) xanax++;
+        if (id === 68) smallAid += qty;       // Small First Aid Kit
+        else if (id === 67) firstAid += qty;  // First Aid Kit
+        else if (id === 206) xanax += qty;    // Xanax
       });
-      debugLog(`DOM Scan Counts -> S:${smallAid} | F:${firstAid} | X:${xanax}`, 'info');
+
+      inventoryCache = { lastFetch: now, smallAid, firstAid, xanax };
+      updateDashboardCounts(smallAid, firstAid, xanax);
+    } catch (err) {
+      updateStatus('API Fetch Failed');
     }
-
-    inventoryCache = {
-      lastFetch: now,
-      smallAid: smallAid,
-      firstAid: firstAid,
-      xanax: xanax
-    };
-
-    updateDashboardCounts(smallAid, firstAid, xanax);
   }
 
   function updateDashboardCounts(smallAid, firstAid, xanax) {
     const sElem = document.getElementById('auto-heal-small-aid');
     const fElem = document.getElementById('auto-heal-first-aid');
     const xElem = document.getElementById('auto-heal-xanax-count');
-
     if (sElem) sElem.innerText = smallAid;
     if (fElem) fElem.innerText = firstAid;
     if (xElem) xElem.innerText = xanax;
   }
 
-  // --- Core Logic ---
   async function checkAndHeal() {
     if (!state.active || state.isProcessing) return;
 
     if (state.completedCount >= state.targetCount) {
-      debugLog('Target count reached! Stopping auto-healer.', 'success');
       toggleActive(false);
-      updateUI();
       return;
     }
 
@@ -284,19 +131,13 @@
                      document.querySelector('a[href*="hospital"]');
 
     if (!hospLink) {
-      updateStatus('Monitoring... (Not in Hospital)');
+      updateStatus('Not in Hospital');
       return;
-    }
-
-    if (!state.wasInHospital) {
-      state.wasInHospital = true;
-      GM_setValue('autoHeal_wasInHospital', true);
     }
 
     const rfcToken = getCookie('rfc_v') || getCookie('rfc_id');
     if (!rfcToken) {
       updateStatus('Error: Missing RFC Token');
-      debugLog('RFC Token not found in cookies!', 'error');
       return;
     }
 
@@ -305,14 +146,10 @@
       if (statusContainer.parentElement) statusContainer = statusContainer.parentElement;
     }
 
-    const ariaLabel = hospLink.getAttribute('aria-label') || '';
-    const searchSubject = `${ariaLabel} ${statusContainer ? statusContainer.textContent : ''}`;
+    const searchSubject = `${hospLink.getAttribute('aria-label') || ''} ${statusContainer ? statusContainer.textContent : ''}`;
     const timerMatch = searchSubject.match(/(\d{1,2}):(\d{2}):(\d{2})/) || searchSubject.match(/(\d{1,2}):(\d{2})/);
 
-    if (!timerMatch) {
-      updateStatus('Hospital detected (parsing timer...)');
-      return;
-    }
+    if (!timerMatch) return;
 
     let hospitalSeconds = 0;
     if (timerMatch.length === 4) {
@@ -322,65 +159,44 @@
     }
 
     if (hospitalSeconds > CONFIG.MAX_HOSPITAL_SECONDS) {
-      updateStatus('Hospital time > 1hr (Skipping actions)');
+      updateStatus('Hospital > 1hr (Skipped)');
       return;
     }
 
     state.isProcessing = true;
 
-    const currentEnergy = getCurrentEnergy();
-    if (state.useXanax && currentEnergy === 0) {
-      debugLog('Energy is 0! Attempting Auto-Xanax...', 'warn');
-      updateStatus('Energy is 0! Taking Xanax...');
+    if (state.useXanax && getCurrentEnergy() === 0) {
+      updateStatus('Taking Xanax...');
       try {
-        const xanaxData = await useItemRequest('206', rfcToken);
-        if (xanaxData.success) {
-          debugLog('Xanax used successfully!', 'success');
-          updateStatus('Used Xanax successfully!');
-          fetchItemCounts(true);
-          setTimeout(() => { state.isProcessing = false; }, 500);
-        } else {
-          debugLog(`Xanax failed: ${xanaxData.text || 'Unknown error'}`, 'error');
-          updateStatus(`Xanax Failed: ${xanaxData.text || 'Server error'}`);
-          setTimeout(() => { state.isProcessing = false; }, 1500);
-        }
+        const res = await useItemRequest('206', rfcToken);
+        updateStatus(res.success ? 'Used Xanax!' : `Xanax Failed: ${res.text || 'Error'}`);
+        if (res.success) fetchItemCounts(true);
       } catch (err) {
-        debugLog(`Xanax Error: ${err}`, 'error');
         updateStatus('Xanax Request Failed');
-        setTimeout(() => { state.isProcessing = false; }, 1500);
       }
+      setTimeout(() => { state.isProcessing = false; }, 1000);
       return;
     }
 
-    const itemId = (hospitalSeconds <= CONFIG.THRESHOLD_SECONDS) ? "67" : "68";
-    const itemName = itemId === "67" ? "Small First Aid Kit (67)" : "First Aid Kit (68)";
-
-    updateStatus(`Healing with ${itemName}...`);
-    debugLog(`Triggering heal request: ${itemName} (Timer: ${hospitalSeconds}s)...`, 'info');
+    const itemId = (hospitalSeconds <= CONFIG.THRESHOLD_SECONDS) ? "68" : "67";
+    updateStatus(`Healing (${itemId === "68" ? 'Small Aid' : 'First Aid'})...`);
 
     try {
-      const data = await useItemRequest(itemId, rfcToken);
-
-      if (data.success) {
+      const res = await useItemRequest(itemId, rfcToken);
+      if (res.success) {
         state.completedCount += 1;
         GM_setValue('autoHeal_completedCount', state.completedCount);
-        debugLog(`Heal success! Completed ${state.completedCount}/${state.targetCount}`, 'success');
         fetchItemCounts(true);
         updateStatus(`Healed! (${state.completedCount}/${state.targetCount})`);
-        setTimeout(() => { state.isProcessing = false; }, 500);
       } else {
-        debugLog(`Heal Failed: ${data.text || 'Server error'}`, 'error');
-        updateStatus(`Failed: ${data.text || 'Server error'}`);
-        setTimeout(() => { state.isProcessing = false; }, 1500);
+        updateStatus(`Failed: ${res.text || 'Error'}`);
       }
     } catch (err) {
-      debugLog(`Heal Request Error: ${err}`, 'error');
-      updateStatus('Request Failed');
-      setTimeout(() => { state.isProcessing = false; }, 1500);
+      updateStatus('Heal Request Failed');
     }
+    setTimeout(() => { state.isProcessing = false; }, 800);
   }
 
-  // --- State Controllers ---
   function toggleActive(val) {
     state.active = val;
     GM_setValue('autoHeal_active', val);
@@ -388,100 +204,52 @@
       state.completedCount = 0;
       GM_setValue('autoHeal_completedCount', 0);
     }
-    debugLog(`Auto Healer state set to: ${val ? 'ON' : 'OFF'}`, val ? 'success' : 'warn');
     updateUI();
   }
 
-  function toggleXanax(val) {
-    state.useXanax = val;
-    GM_setValue('autoHeal_useXanax', val);
-    debugLog(`Auto Xanax toggled: ${val}`, 'info');
-    updateUI();
-  }
-
-  function setTargetCount(val) {
-    const num = Math.max(1, parseInt(val, 10) || 1);
-    state.targetCount = num;
-    GM_setValue('autoHeal_targetCount', num);
-    debugLog(`Max runs set to: ${num}`, 'info');
-    updateUI();
-  }
-
-  function setApiKey(val) {
-    state.apiKey = val.trim();
-    GM_setValue('autoHeal_apiKey', state.apiKey);
-    debugLog(`API Key updated. Triggering manual refresh...`, 'info');
-    fetchItemCounts(true);
-  }
-
-  // --- Inject UI Controls ---
   function createUI() {
     if (document.getElementById('auto-heal-widget')) return;
 
-    const myId = getMyPlayerId();
     const widget = document.createElement('div');
     widget.id = 'auto-heal-widget';
-
     const positionStyles = (state.posX !== null && state.posY !== null)
       ? `top: ${state.posY}px; left: ${state.posX}px;`
       : `bottom: 20px; right: 20px;`;
 
     widget.style.cssText = `
-      position: fixed;
-      ${positionStyles}
-      z-index: 999999;
-      background: #222;
-      color: #fff;
-      border: 1px solid #444;
-      border-radius: 8px;
-      padding: 12px 16px;
-      font-family: Arial, sans-serif;
-      font-size: 13px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-      width: 260px;
-      user-select: none;
+      position: fixed; ${positionStyles} z-index: 999999; background: #222; color: #fff;
+      border: 1px solid #444; border-radius: 8px; padding: 12px 16px; font-family: Arial, sans-serif;
+      font-size: 13px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); width: 250px; user-select: none;
     `;
 
     widget.innerHTML = `
       <div id="auto-heal-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #333; padding-bottom: 6px; cursor: move;">
-        <strong style="color: #4caf50;">arhi's Auto Healer</strong>
+        <strong style="color: #4caf50;">Auto Healer</strong>
         <span id="auto-heal-status-indicator" style="font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #555;">OFF</span>
       </div>
 
       <div style="margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between;">
         <label style="font-size: 12px; color: #ccc;">Your ID:</label>
         <div style="display: flex; gap: 4px;">
-          <input type="text" id="auto-heal-my-id" readonly value="${myId}"
-                 style="width: 75px; background: #111; color: #4caf50; font-weight: bold; border: 1px solid #555; border-radius: 4px; text-align: center; padding: 2px; cursor: text;">
+          <input type="text" id="auto-heal-my-id" readonly value="${getMyPlayerId()}" style="width: 75px; background: #111; color: #4caf50; font-weight: bold; border: 1px solid #555; border-radius: 4px; text-align: center; padding: 2px;">
           <button id="auto-heal-copy-id-btn" style="background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 2px 6px; font-size: 11px; cursor: pointer;">Copy</button>
         </div>
       </div>
 
       <div style="margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between;">
         <label for="auto-heal-api-key" style="font-size: 11px; color: #ccc;">API Key:</label>
-        <input type="password" id="auto-heal-api-key" value="${state.apiKey}" placeholder="Torn API Key"
-               style="width: 140px; background: #111; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 2px 4px; font-size: 11px;">
+        <input type="password" id="auto-heal-api-key" value="${state.apiKey}" placeholder="Torn API Key" style="width: 140px; background: #111; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 2px 4px; font-size: 11px;">
       </div>
 
       <div style="background: #181818; border: 1px solid #333; border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; font-size: 11px;">
-        <div style="display: flex; justify-content: space-between; margin-bottom: 3px;">
-          <span>Small First Aid:</span>
-          <strong id="auto-heal-small-aid" style="color: #ff9800;">0</strong>
-        </div>
-        <div style="display: flex; justify-content: space-between; margin-bottom: 3px;">
-          <span>First Aid Kit:</span>
-          <strong id="auto-heal-first-aid" style="color: #2196f3;">0</strong>
-        </div>
-        <div style="display: flex; justify-content: space-between;">
-          <span>Xanax:</span>
-          <strong id="auto-heal-xanax-count" style="color: #e91e63;">0</strong>
-        </div>
+        <div style="display: flex; justify-content: space-between; margin-bottom: 3px;"><span>Small First Aid:</span><strong id="auto-heal-small-aid" style="color: #ff9800;">0</strong></div>
+        <div style="display: flex; justify-content: space-between; margin-bottom: 3px;"><span>First Aid Kit:</span><strong id="auto-heal-first-aid" style="color: #2196f3;">0</strong></div>
+        <div style="display: flex; justify-content: space-between;"><span>Xanax:</span><strong id="auto-heal-xanax-count" style="color: #e91e63;">0</strong></div>
       </div>
 
       <div style="margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
         <label for="auto-heal-target">Max Runs:</label>
-        <input type="number" id="auto-heal-target" min="1" max="999" value="${state.targetCount}"
-               style="width: 55px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; text-align: center; padding: 2px;">
+        <input type="number" id="auto-heal-target" min="1" max="999" value="${state.targetCount}" style="width: 55px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; text-align: center; padding: 2px;">
       </div>
 
       <div style="margin-bottom: 8px; display: flex; align-items: center; gap: 6px;">
@@ -489,69 +257,29 @@
         <label for="auto-heal-xanax" style="cursor: pointer; font-size: 12px;">Auto Xanax on 0 Energy</label>
       </div>
 
-      <div style="margin-bottom: 6px; font-size: 11px; color: #aaa;" id="auto-heal-progress">
-        Progress: ${state.completedCount} / ${state.targetCount} times
-      </div>
+      <div style="margin-bottom: 4px; font-size: 11px; color: #aaa;" id="auto-heal-progress">Progress: ${state.completedCount} / ${state.targetCount} times</div>
+      <div style="margin-bottom: 8px; font-size: 12px;" id="auto-heal-message">Status: Idle</div>
 
-      <div style="margin-bottom: 8px;" id="auto-heal-message">
-        Status: Idle
-      </div>
-
-      <button id="auto-heal-toggle-btn" style="
-        width: 100%;
-        padding: 6px;
-        border: none;
-        border-radius: 4px;
-        font-weight: bold;
-        cursor: pointer;
-        background: #4caf50;
-        color: #fff;
-        margin-bottom: 8px;
-      ">TURN ON</button>
-
-      <!-- Debug Panel -->
-      <div style="border-top: 1px solid #333; padding-top: 6px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-          <span style="font-size: 10px; color: #888; font-weight: bold;">DEBUG CONSOLE</span>
-          <button id="auto-heal-clear-debug" style="background: none; border: none; color: #666; font-size: 9px; cursor: pointer; text-decoration: underline;">Clear</button>
-        </div>
-        <div id="auto-heal-debug-logs" style="
-          background: #111;
-          border: 1px solid #333;
-          border-radius: 4px;
-          height: 90px;
-          overflow-y: auto;
-          font-family: monospace;
-          font-size: 10px;
-          padding: 4px;
-          line-height: 1.2;
-        "></div>
-      </div>
+      <button id="auto-heal-toggle-btn" style="width: 100%; padding: 6px; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; background: #4caf50; color: #fff;">TURN ON</button>
     `;
 
     document.body.appendChild(widget);
-
     makeWidgetDraggable(widget, document.getElementById('auto-heal-header'));
 
-    document.getElementById('auto-heal-toggle-btn').addEventListener('click', () => {
-      toggleActive(!state.active);
-    });
-
+    document.getElementById('auto-heal-toggle-btn').addEventListener('click', () => toggleActive(!state.active));
     document.getElementById('auto-heal-xanax').addEventListener('change', (e) => {
-      toggleXanax(e.target.checked);
+      state.useXanax = e.target.checked;
+      GM_setValue('autoHeal_useXanax', state.useXanax);
     });
-
     document.getElementById('auto-heal-target').addEventListener('change', (e) => {
-      setTargetCount(e.target.value);
+      state.targetCount = Math.max(1, parseInt(e.target.value, 10) || 1);
+      GM_setValue('autoHeal_targetCount', state.targetCount);
+      updateUI();
     });
-
     document.getElementById('auto-heal-api-key').addEventListener('change', (e) => {
-      setApiKey(e.target.value);
-    });
-
-    document.getElementById('auto-heal-clear-debug').addEventListener('click', () => {
-      const logBox = document.getElementById('auto-heal-debug-logs');
-      if (logBox) logBox.innerHTML = '';
+      state.apiKey = e.target.value.trim();
+      GM_setValue('autoHeal_apiKey', state.apiKey);
+      fetchItemCounts(true);
     });
 
     const copyBtn = document.getElementById('auto-heal-copy-id-btn');
@@ -560,11 +288,7 @@
       idInput.select();
       navigator.clipboard.writeText(idInput.value).then(() => {
         copyBtn.innerText = 'Copied!';
-        copyBtn.style.background = '#4caf50';
-        setTimeout(() => {
-          copyBtn.innerText = 'Copy';
-          copyBtn.style.background = '#333';
-        }, 1200);
+        setTimeout(() => { copyBtn.innerText = 'Copy'; }, 1200);
       });
     });
 
@@ -572,51 +296,36 @@
     fetchItemCounts(true);
   }
 
-  // --- Drag and Drop Functionality ---
   function makeWidgetDraggable(elmnt, dragHandle) {
     let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
-
-    dragHandle.onmousedown = dragMouseDown;
-
-    function dragMouseDown(e) {
+    dragHandle.onmousedown = (e) => {
       e.preventDefault();
       pos3 = e.clientX;
       pos4 = e.clientY;
-
-      document.onmouseup = closeDragElement;
-      document.onmousemove = elementDrag;
-    }
-
-    function elementDrag(e) {
-      e.preventDefault();
-      pos1 = pos3 - e.clientX;
-      pos2 = pos4 - e.clientY;
-      pos3 = e.clientX;
-      pos4 = e.clientY;
-
-      const newTop = elmnt.offsetTop - pos2;
-      const newLeft = elmnt.offsetLeft - pos1;
-
-      elmnt.style.bottom = 'auto';
-      elmnt.style.right = 'auto';
-      elmnt.style.top = newTop + "px";
-      elmnt.style.left = newLeft + "px";
-    }
-
-    function closeDragElement() {
-      document.onmouseup = null;
-      document.onmousemove = null;
-
-      GM_setValue('autoHeal_posX', elmnt.offsetLeft);
-      GM_setValue('autoHeal_posY', elmnt.offsetTop);
-    }
+      document.onmouseup = () => {
+        document.onmouseup = null;
+        document.onmousemove = null;
+        GM_setValue('autoHeal_posX', elmnt.offsetLeft);
+        GM_setValue('autoHeal_posY', elmnt.offsetTop);
+      };
+      document.onmousemove = (e) => {
+        e.preventDefault();
+        pos1 = pos3 - e.clientX;
+        pos2 = pos4 - e.clientY;
+        pos3 = e.clientX;
+        pos4 = e.clientY;
+        elmnt.style.bottom = 'auto';
+        elmnt.style.right = 'auto';
+        elmnt.style.top = (elmnt.offsetTop - pos2) + "px";
+        elmnt.style.left = (elmnt.offsetLeft - pos1) + "px";
+      };
+    };
   }
 
   function updateUI() {
     const btn = document.getElementById('auto-heal-toggle-btn');
     const indicator = document.getElementById('auto-heal-status-indicator');
     const progress = document.getElementById('auto-heal-progress');
-
     if (!btn) return;
 
     if (state.active) {
@@ -631,9 +340,7 @@
       indicator.style.background = '#555';
     }
 
-    if (progress) {
-      progress.innerText = `Progress: ${state.completedCount} / ${state.targetCount} times`;
-    }
+    if (progress) progress.innerText = `Progress: ${state.completedCount} / ${state.targetCount} times`;
   }
 
   function updateStatus(text) {
@@ -641,17 +348,12 @@
     if (msg) msg.innerText = `Status: ${text}`;
   }
 
-  // --- Initialization ---
   function init() {
     createUI();
-    debugLog('Auto-Healer Loaded (v3.1 - Resilient API Parsing)', 'info');
     setInterval(checkAndHeal, CONFIG.DOM_CHECK_INTERVAL_MS);
     setInterval(() => fetchItemCounts(), CONFIG.API_CHECK_INTERVAL_MS);
   }
 
-  if (document.body) {
-    init();
-  } else {
-    window.addEventListener('DOMContentLoaded', init);
-  }
+  if (document.body) init();
+  else window.addEventListener('DOMContentLoaded', init);
 })();
