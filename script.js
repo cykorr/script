@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      2.9
-// @description  Automates medical item healing, auto Xanax (default ON), max runs (default 13), dual-interval DOM/API tracking.
+// @version      3.0
+// @description  Automates medical item healing, auto Xanax, dual-interval DOM/API tracking, and built-in debug panel.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/*
 // @match        https://www.torn.com/item.php*
@@ -20,11 +20,10 @@
 
   // --- Configuration & Persistent State ---
   const CONFIG = {
-    DOM_CHECK_INTERVAL_MS: 500,  // Check status & hospital timer every 0.5 seconds
+    DOM_CHECK_INTERVAL_MS: 500,   // Check status & hospital timer every 0.5 seconds
     API_CHECK_INTERVAL_MS: 5000,  // Fetch inventory API every 5 seconds
-    CACHE_TTL_MS: 30000,        // Cache fallback TTL: 30 seconds
-    THRESHOLD_SECONDS: 1203,    // 20 minutes and 3 seconds
-    MAX_HOSPITAL_SECONDS: 3600  // 1 hour
+    THRESHOLD_SECONDS: 1203,     // 20 minutes and 3 seconds
+    MAX_HOSPITAL_SECONDS: 3600   // 1 hour
   };
 
   let state = {
@@ -46,6 +45,31 @@
     firstAid: 0,
     xanax: 0
   };
+
+  // --- Debug Logging Utility ---
+  function debugLog(msg, type = 'info') {
+    const logBox = document.getElementById('auto-heal-debug-logs');
+    const colorMap = {
+      info: '#ccc',
+      success: '#4caf50',
+      warn: '#ff9800',
+      error: '#f44336'
+    };
+    const time = new Date().toLocaleTimeString();
+    const formattedMsg = `[${time}] ${msg}`;
+
+    console.log(`[AutoHealer Debug] ${msg}`);
+
+    if (logBox) {
+      const line = document.createElement('div');
+      line.style.color = colorMap[type] || '#ccc';
+      line.style.borderBottom = '1px solid #222';
+      line.style.padding = '1px 0';
+      line.innerText = formattedMsg;
+      logBox.appendChild(line);
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+  }
 
   // Helper: Extract cookie values
   const getCookie = (name) =>
@@ -105,10 +129,10 @@
           try {
             resolve(JSON.parse(res.responseText));
           } catch (e) {
-            reject(e);
+            reject(`JSON Parse Error: ${res.responseText.slice(0, 100)}...`);
           }
         },
-        onerror: (err) => reject(err)
+        onerror: (err) => reject(`Network Request Error`)
       });
     });
   }
@@ -117,7 +141,6 @@
   async function fetchItemCounts(forceRefresh = false) {
     const now = Date.now();
 
-    // Skip if not forced and standard timer hasn't elapsed relative to last fetch
     if (!forceRefresh && (now - inventoryCache.lastFetch < CONFIG.API_CHECK_INTERVAL_MS)) {
       updateDashboardCounts(inventoryCache.smallAid, inventoryCache.firstAid, inventoryCache.xanax);
       return;
@@ -128,16 +151,19 @@
 
     // 1. Fetch via API Key if set
     if (state.apiKey) {
+      debugLog(`Querying Torn API with key...`);
       try {
         const apiData = await fetchApiGM(`https://api.torn.com/user/?selections=inventory&key=${state.apiKey}`);
 
         if (apiData.error) {
-          console.error('❌ Torn API Error:', apiData.error);
+          debugLog(`API Error Code ${apiData.error.code}: ${apiData.error.error}`, 'error');
           updateStatus(`API Error: ${apiData.error.error}`);
         } else if (apiData && apiData.inventory) {
           const rawItems = apiData.inventory;
           const itemsList = Array.isArray(rawItems) ? rawItems : Object.values(rawItems);
           
+          debugLog(`API response contained ${itemsList.length} total inventory objects.`, 'info');
+
           itemsList.forEach(item => {
             const id = parseInt(item.ID || item.id || item.item_id || item.itemID, 10);
             const qty = parseInt(item.quantity || item.qty || item.amount || 1, 10);
@@ -146,15 +172,22 @@
             if (id === 68) firstAid += qty;
             if (id === 206) xanax += qty;
           });
+
           found = true;
+          debugLog(`Parsed Counts -> S:${smallAid} | F:${firstAid} | X:${xanax}`, 'success');
+        } else {
+          debugLog(`API response missing 'inventory' key. Keys found: ${Object.keys(apiData).join(', ')}`, 'warn');
         }
       } catch (err) {
-        console.error('❌ Auto-Healer API Network/CORS Error:', err);
+        debugLog(`API Request Failed: ${err}`, 'error');
       }
+    } else {
+      debugLog('No API key entered. Skipping API fetch.', 'warn');
     }
 
-    // 2. Fallback: Query local item endpoint
+    // 2. Fallback: Local item endpoint
     if (!found) {
+      debugLog('Attempting fallback: Local item endpoint...');
       try {
         const rfcToken = getCookie('rfc_v') || getCookie('rfc_id');
         const response = await fetch(`/item.php?rfcv=${rfcToken}`, {
@@ -178,23 +211,25 @@
             if (id === 206) xanax += qty;
           });
           found = true;
+          debugLog(`Local Endpoint Counts -> S:${smallAid} | F:${firstAid} | X:${xanax}`, 'success');
         }
       } catch (e) {
-        // Fall through to DOM scan
+        debugLog('Local item endpoint failed or not on item page.', 'warn');
       }
     }
 
     // 3. Fallback: Scan DOM directly
     if (!found) {
+      debugLog('Attempting fallback: DOM Scan...');
       document.querySelectorAll('[data-item], .item-hoolder, [class*="item_"]').forEach(el => {
         const text = el.textContent || '';
         if (text.includes('Small First Aid Kit')) smallAid++;
         if (text.includes('First Aid Kit') && !text.includes('Small')) firstAid++;
         if (text.includes('Xanax')) xanax++;
       });
+      debugLog(`DOM Scan Counts -> S:${smallAid} | F:${firstAid} | X:${xanax}`, 'info');
     }
 
-    // Save to Cache
     inventoryCache = {
       lastFetch: now,
       smallAid: smallAid,
@@ -219,15 +254,13 @@
   async function checkAndHeal() {
     if (!state.active || state.isProcessing) return;
 
-    // Check target runs limit
     if (state.completedCount >= state.targetCount) {
-      console.log('🏁 Auto-Healer: Target hospital count reached. Turning OFF.');
+      debugLog('Target count reached! Stopping auto-healer.', 'success');
       toggleActive(false);
       updateUI();
       return;
     }
 
-    // 1. Locate Hospital Status Link via DOM (Runs at 0.5s interval)
     const hospLink = document.querySelector('a[aria-label^="Hospital:"]') ||
                      document.querySelector('a[aria-label*="Hospital"]') ||
                      document.querySelector('a[href*="hospital"]');
@@ -245,10 +278,10 @@
     const rfcToken = getCookie('rfc_v') || getCookie('rfc_id');
     if (!rfcToken) {
       updateStatus('Error: Missing RFC Token');
+      debugLog('RFC Token not found in cookies!', 'error');
       return;
     }
 
-    // 2. Time Extraction
     let statusContainer = hospLink;
     for (let i = 0; i < 4; i++) {
       if (statusContainer.parentElement) statusContainer = statusContainer.parentElement;
@@ -277,52 +310,53 @@
 
     state.isProcessing = true;
 
-    // 3. Auto-Xanax Check
     const currentEnergy = getCurrentEnergy();
     if (state.useXanax && currentEnergy === 0) {
+      debugLog('Energy is 0! Attempting Auto-Xanax...', 'warn');
       updateStatus('Energy is 0! Taking Xanax...');
       try {
         const xanaxData = await useItemRequest('206', rfcToken);
         if (xanaxData.success) {
-          console.log('✅ Auto-Healer: Used Xanax.');
+          debugLog('Xanax used successfully!', 'success');
           updateStatus('Used Xanax successfully!');
-          fetchItemCounts(true); // Force immediate inventory update after using item
+          fetchItemCounts(true);
           setTimeout(() => { state.isProcessing = false; }, 500);
         } else {
+          debugLog(`Xanax failed: ${xanaxData.text || 'Unknown error'}`, 'error');
           updateStatus(`Xanax Failed: ${xanaxData.text || 'Server error'}`);
           setTimeout(() => { state.isProcessing = false; }, 1500);
         }
       } catch (err) {
-        console.error('❌ Xanax Error:', err);
+        debugLog(`Xanax Error: ${err}`, 'error');
         updateStatus('Xanax Request Failed');
         setTimeout(() => { state.isProcessing = false; }, 1500);
       }
       return;
     }
 
-    // 4. Select Medical Item
     const itemId = (hospitalSeconds <= CONFIG.THRESHOLD_SECONDS) ? "67" : "68";
     const itemName = itemId === "67" ? "Small First Aid Kit (67)" : "First Aid Kit (68)";
 
     updateStatus(`Healing with ${itemName}...`);
+    debugLog(`Triggering heal request: ${itemName} (Timer: ${hospitalSeconds}s)...`, 'info');
 
-    // 5. Send POST Request
     try {
       const data = await useItemRequest(itemId, rfcToken);
 
       if (data.success) {
         state.completedCount += 1;
         GM_setValue('autoHeal_completedCount', state.completedCount);
-        console.log(`✅ Auto-Healer: Used ${itemName}. Total runs: ${state.completedCount}/${state.targetCount}`);
-        fetchItemCounts(true); // Force immediate inventory update after healing
+        debugLog(`Heal success! Completed ${state.completedCount}/${state.targetCount}`, 'success');
+        fetchItemCounts(true);
         updateStatus(`Healed! (${state.completedCount}/${state.targetCount})`);
         setTimeout(() => { state.isProcessing = false; }, 500);
       } else {
+        debugLog(`Heal Failed: ${data.text || 'Server error'}`, 'error');
         updateStatus(`Failed: ${data.text || 'Server error'}`);
         setTimeout(() => { state.isProcessing = false; }, 1500);
       }
     } catch (err) {
-      console.error('❌ Auto-Healer Error:', err);
+      debugLog(`Heal Request Error: ${err}`, 'error');
       updateStatus('Request Failed');
       setTimeout(() => { state.isProcessing = false; }, 1500);
     }
@@ -336,12 +370,14 @@
       state.completedCount = 0;
       GM_setValue('autoHeal_completedCount', 0);
     }
+    debugLog(`Auto Healer state set to: ${val ? 'ON' : 'OFF'}`, val ? 'success' : 'warn');
     updateUI();
   }
 
   function toggleXanax(val) {
     state.useXanax = val;
     GM_setValue('autoHeal_useXanax', val);
+    debugLog(`Auto Xanax toggled: ${val}`, 'info');
     updateUI();
   }
 
@@ -349,12 +385,14 @@
     const num = Math.max(1, parseInt(val, 10) || 1);
     state.targetCount = num;
     GM_setValue('autoHeal_targetCount', num);
+    debugLog(`Max runs set to: ${num}`, 'info');
     updateUI();
   }
 
   function setApiKey(val) {
     state.apiKey = val.trim();
     GM_setValue('autoHeal_apiKey', state.apiKey);
+    debugLog(`API Key updated. Triggering manual refresh...`, 'info');
     fetchItemCounts(true);
   }
 
@@ -382,7 +420,7 @@
       font-family: Arial, sans-serif;
       font-size: 13px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-      width: 235px;
+      width: 260px;
       user-select: none;
     `;
 
@@ -404,7 +442,7 @@
       <div style="margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between;">
         <label for="auto-heal-api-key" style="font-size: 11px; color: #ccc;">API Key:</label>
         <input type="password" id="auto-heal-api-key" value="${state.apiKey}" placeholder="Torn API Key"
-               style="width: 120px; background: #111; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 2px 4px; font-size: 11px;">
+               style="width: 140px; background: #111; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 2px 4px; font-size: 11px;">
       </div>
 
       <div style="background: #181818; border: 1px solid #333; border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; font-size: 11px;">
@@ -433,7 +471,7 @@
         <label for="auto-heal-xanax" style="cursor: pointer; font-size: 12px;">Auto Xanax on 0 Energy</label>
       </div>
 
-      <div style="margin-bottom: 10px; font-size: 11px; color: #aaa;" id="auto-heal-progress">
+      <div style="margin-bottom: 6px; font-size: 11px; color: #aaa;" id="auto-heal-progress">
         Progress: ${state.completedCount} / ${state.targetCount} times
       </div>
 
@@ -450,7 +488,27 @@
         cursor: pointer;
         background: #4caf50;
         color: #fff;
+        margin-bottom: 8px;
       ">TURN ON</button>
+
+      <!-- Debug Panel -->
+      <div style="border-top: 1px solid #333; padding-top: 6px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+          <span style="font-size: 10px; color: #888; font-weight: bold;">DEBUG CONSOLE</span>
+          <button id="auto-heal-clear-debug" style="background: none; border: none; color: #666; font-size: 9px; cursor: pointer; text-decoration: underline;">Clear</button>
+        </div>
+        <div id="auto-heal-debug-logs" style="
+          background: #111;
+          border: 1px solid #333;
+          border-radius: 4px;
+          height: 90px;
+          overflow-y: auto;
+          font-family: monospace;
+          font-size: 10px;
+          padding: 4px;
+          line-height: 1.2;
+        "></div>
+      </div>
     `;
 
     document.body.appendChild(widget);
@@ -471,6 +529,11 @@
 
     document.getElementById('auto-heal-api-key').addEventListener('change', (e) => {
       setApiKey(e.target.value);
+    });
+
+    document.getElementById('auto-heal-clear-debug').addEventListener('click', () => {
+      const logBox = document.getElementById('auto-heal-debug-logs');
+      if (logBox) logBox.innerHTML = '';
     });
 
     const copyBtn = document.getElementById('auto-heal-copy-id-btn');
@@ -563,9 +626,8 @@
   // --- Initialization ---
   function init() {
     createUI();
-    // Loop 1: Fast DOM scraping / check timer (every 0.5 seconds)
+    debugLog('Auto-Healer Script Loaded (v3.0)', 'info');
     setInterval(checkAndHeal, CONFIG.DOM_CHECK_INTERVAL_MS);
-    // Loop 2: Background API inventory synchronization (every 5 seconds)
     setInterval(() => fetchItemCounts(), CONFIG.API_CHECK_INTERVAL_MS);
   }
 
