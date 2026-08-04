@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      4.7
-// @description  Automated hospital healer using Torn API v2 with server sync locking.
+// @version      4.8
+// @description  Automated hospital healer using Torn API v2 with precise DOM parsing and double-fire prevention.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/item.php*
 // @grant        GM_getValue
@@ -17,10 +17,10 @@
   if (!window.location.pathname.endsWith('/item.php')) return;
 
   const CONFIG = {
-    DOM_CHECK_INTERVAL_MS: 300,
+    DOM_CHECK_INTERVAL_MS: 400,
     API_CHECK_INTERVAL_MS: 5000,
-    SERVER_SYNC_DELAY_MS: 1200, // Waits 1.2s for Torn's server state to update before allowing another heal
-    THRESHOLD_SECONDS: 1203,
+    POST_HEAL_WAIT_MS: 1500, // Mandatory pause between heals to allow Torn server sync
+    THRESHOLD_SECONDS: 1200, // 20 minutes: >20m uses First Aid Kit (67), <=20m uses Small Aid (68)
     MAX_HOSPITAL_SECONDS: 3600
   };
 
@@ -57,6 +57,30 @@
                  document.querySelector('[class*="energy"] [class*="value"]') ||
                  document.querySelector('#barEnergy .val');
     return elem ? parseInt(elem.textContent.match(/\d+/)?.[0] || 0, 10) : null;
+  }
+
+  function parseHospitalSeconds(text) {
+    if (!text) return 0;
+
+    // Match "1h 25m 10s", "0h 26m", "15m 30s", "26m"
+    const textMatch = text.match(/(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/i);
+    if (textMatch && (textMatch[1] || textMatch[2] || textMatch[3])) {
+      const h = parseInt(textMatch[1] || 0, 10);
+      const m = parseInt(textMatch[2] || 0, 10);
+      const s = parseInt(textMatch[3] || 0, 10);
+      if (h > 0 || m > 0 || s > 0) return (h * 3600) + (m * 60) + s;
+    }
+
+    // Match "01:25:10" or "25:10"
+    const clockMatch = text.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    if (clockMatch) {
+      if (clockMatch[3] !== undefined) {
+        return (parseInt(clockMatch[1], 10) * 3600) + (parseInt(clockMatch[2], 10) * 60) + parseInt(clockMatch[3], 10);
+      }
+      return (parseInt(clockMatch[1], 10) * 60) + parseInt(clockMatch[2], 10);
+    }
+
+    return 0;
   }
 
   async function useItemRequest(itemId, rfcToken) {
@@ -146,40 +170,29 @@
       return;
     }
 
-    const hospLink = document.querySelector('a[aria-label^="Hospital:"]') ||
-                     document.querySelector('a[aria-label*="Hospital"]') ||
-                     document.querySelector('a[href*="hospital"]');
-
+    const hospLink = document.querySelector('a[aria-label*="Hospital"]');
     if (!hospLink) {
       updateStatus('Not in Hospital');
+      return;
+    }
+
+    const ariaLabel = hospLink.getAttribute('aria-label') || '';
+    const parentText = hospLink.parentElement ? hospLink.parentElement.textContent : '';
+    const hospitalSeconds = parseHospitalSeconds(ariaLabel) || parseHospitalSeconds(parentText);
+
+    if (hospitalSeconds <= 0) {
+      updateStatus('Not in Hospital');
+      return;
+    }
+
+    if (hospitalSeconds > CONFIG.MAX_HOSPITAL_SECONDS) {
+      updateStatus('Hospital > 1hr (Skipped)');
       return;
     }
 
     const rfcToken = getCookie('rfc_v') || getCookie('rfc_id');
     if (!rfcToken) {
       updateStatus('Error: Missing RFC Token');
-      return;
-    }
-
-    let statusContainer = hospLink;
-    for (let i = 0; i < 4; i++) {
-      if (statusContainer.parentElement) statusContainer = statusContainer.parentElement;
-    }
-
-    const searchSubject = `${hospLink.getAttribute('aria-label') || ''} ${statusContainer ? statusContainer.textContent : ''}`;
-    const timerMatch = searchSubject.match(/(\d{1,2}):(\d{2}):(\d{2})/) || searchSubject.match(/(\d{1,2}):(\d{2})/);
-
-    if (!timerMatch) return;
-
-    let hospitalSeconds = 0;
-    if (timerMatch.length === 4) {
-      hospitalSeconds = (parseInt(timerMatch[1], 10) * 3600) + (parseInt(timerMatch[2], 10) * 60) + parseInt(timerMatch[3], 10);
-    } else if (timerMatch.length === 3) {
-      hospitalSeconds = (parseInt(timerMatch[1], 10) * 60) + parseInt(timerMatch[2], 10);
-    }
-
-    if (hospitalSeconds > CONFIG.MAX_HOSPITAL_SECONDS) {
-      updateStatus('Hospital > 1hr (Skipped)');
       return;
     }
 
@@ -198,12 +211,14 @@
       } catch (err) {
         updateStatus('Xanax Request Failed');
       }
-      setTimeout(() => { state.isProcessing = false; }, CONFIG.SERVER_SYNC_DELAY_MS);
+      setTimeout(() => { state.isProcessing = false; }, CONFIG.POST_HEAL_WAIT_MS);
       return;
     }
 
-    const itemId = (hospitalSeconds <= CONFIG.THRESHOLD_SECONDS) ? "68" : "67";
-    updateStatus(`Healing (${itemId === "68" ? 'Small Aid' : 'First Aid'})...`);
+    // Determine correct item based on parsed time
+    const itemId = (hospitalSeconds > CONFIG.THRESHOLD_SECONDS) ? "67" : "68";
+    const itemName = itemId === "67" ? 'First Aid Kit' : 'Small Aid';
+    updateStatus(`Healing (${itemName} - ${Math.floor(hospitalSeconds / 60)}m left)...`);
 
     try {
       const res = await useItemRequest(itemId, rfcToken);
@@ -211,7 +226,7 @@
         state.completedCount += 1;
         GM_setValue('autoHeal_completedCount', state.completedCount);
         fetchItemCounts(true);
-        updateStatus(`Healed! (${state.completedCount}/${state.targetCount})`);
+        updateStatus(`Healed with ${itemName}! (${state.completedCount}/${state.targetCount})`);
       } else {
         updateStatus(`Failed: ${res.text || 'Error'}`);
       }
@@ -219,8 +234,8 @@
       updateStatus('Heal Request Failed');
     }
 
-    // Keep processing locked long enough to prevent double-sends while Torn backend synchronizes
-    setTimeout(() => { state.isProcessing = false; }, CONFIG.SERVER_SYNC_DELAY_MS);
+    // Prevent re-executing until backend synchronizes
+    setTimeout(() => { state.isProcessing = false; }, CONFIG.POST_HEAL_WAIT_MS);
   }
 
   function toggleActive(val) {
