@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      4.4
-// @description  Automated hospital healer using Torn API v2 with locally stored item counts. Runs exclusively on item.php page.
+// @version      4.6
+// @description  Automated hospital healer using Torn API v2 with instant zero-cooldown response tracking.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/item.php*
 // @grant        GM_getValue
@@ -14,11 +14,10 @@
 (function () {
   'use strict';
 
-  // Strict page guard: ensure code only runs on item.php
   if (!window.location.pathname.endsWith('/item.php')) return;
 
   const CONFIG = {
-    DOM_CHECK_INTERVAL_MS: 500,
+    DOM_CHECK_INTERVAL_MS: 200, // Reduced to 200ms for faster detection
     API_CHECK_INTERVAL_MS: 5000,
     THRESHOLD_SECONDS: 1203,
     MAX_HOSPITAL_SECONDS: 3600
@@ -31,11 +30,12 @@
     apiKey: GM_getValue('autoHeal_apiKey', ''),
     completedCount: GM_getValue('autoHeal_completedCount', 0),
     isProcessing: false,
+    predictedHospSeconds: 0,
+    lastDomUpdateSec: 0,
     posX: GM_getValue('autoHeal_posX', null),
     posY: GM_getValue('autoHeal_posY', null)
   };
 
-  // Cache initialized directly from local storage
   let inventoryCache = { 
     lastFetch: 0, 
     smallAid: GM_getValue('autoHeal_smallAid', 0), 
@@ -118,10 +118,8 @@
         if (id === 206) xanax += qty;         // Xanax
       });
 
-      // Update memory cache
       inventoryCache = { lastFetch: now, smallAid, firstAid, xanax };
 
-      // Save counts to local storage
       GM_setValue('autoHeal_smallAid', smallAid);
       GM_setValue('autoHeal_firstAid', firstAid);
       GM_setValue('autoHeal_xanax', xanax);
@@ -154,6 +152,7 @@
                      document.querySelector('a[href*="hospital"]');
 
     if (!hospLink) {
+      state.predictedHospSeconds = 0;
       updateStatus('Not in Hospital');
       return;
     }
@@ -174,14 +173,27 @@
 
     if (!timerMatch) return;
 
-    let hospitalSeconds = 0;
+    let domSec = 0;
     if (timerMatch.length === 4) {
-      hospitalSeconds = (parseInt(timerMatch[1], 10) * 3600) + (parseInt(timerMatch[2], 10) * 60) + parseInt(timerMatch[3], 10);
+      domSec = (parseInt(timerMatch[1], 10) * 3600) + (parseInt(timerMatch[2], 10) * 60) + parseInt(timerMatch[3], 10);
     } else if (timerMatch.length === 3) {
-      hospitalSeconds = (parseInt(timerMatch[1], 10) * 60) + parseInt(timerMatch[2], 10);
+      domSec = (parseInt(timerMatch[1], 10) * 60) + parseInt(timerMatch[2], 10);
     }
 
-    if (hospitalSeconds > CONFIG.MAX_HOSPITAL_SECONDS) {
+    // Sync state if DOM updated to a smaller value or reset
+    if (domSec < state.lastDomUpdateSec || state.predictedHospSeconds === 0) {
+      state.predictedHospSeconds = domSec;
+    }
+    state.lastDomUpdateSec = domSec;
+
+    const currentHospSeconds = Math.min(domSec, state.predictedHospSeconds);
+
+    if (currentHospSeconds <= 0) {
+      updateStatus('Out of Hospital');
+      return;
+    }
+
+    if (currentHospSeconds > CONFIG.MAX_HOSPITAL_SECONDS) {
       updateStatus('Hospital > 1hr (Skipped)');
       return;
     }
@@ -192,21 +204,29 @@
       updateStatus('Taking Xanax...');
       try {
         const res = await useItemRequest('206', rfcToken);
-        updateStatus(res.success ? 'Used Xanax!' : `Xanax Failed: ${res.text || 'Error'}`);
-        if (res.success) fetchItemCounts(true);
+        if (res.success) {
+          updateStatus('Used Xanax!');
+          fetchItemCounts(true);
+        } else {
+          updateStatus(`Xanax Failed: ${res.text || 'Error'}`);
+        }
       } catch (err) {
         updateStatus('Xanax Request Failed');
+      } finally {
+        state.isProcessing = false;
       }
-      setTimeout(() => { state.isProcessing = false; }, 1000);
       return;
     }
 
-    const itemId = (hospitalSeconds <= CONFIG.THRESHOLD_SECONDS) ? "68" : "67";
+    const itemId = (currentHospSeconds <= CONFIG.THRESHOLD_SECONDS) ? "68" : "67";
+    const estimatedReduction = itemId === "68" ? 900 : 1800; // ~15 mins or ~30 mins estimation guard
     updateStatus(`Healing (${itemId === "68" ? 'Small Aid' : 'First Aid'})...`);
 
     try {
       const res = await useItemRequest(itemId, rfcToken);
       if (res.success) {
+        // Instantly reduce local prediction so we don't double fire before DOM updates
+        state.predictedHospSeconds = Math.max(0, currentHospSeconds - estimatedReduction);
         state.completedCount += 1;
         GM_setValue('autoHeal_completedCount', state.completedCount);
         fetchItemCounts(true);
@@ -216,8 +236,10 @@
       }
     } catch (err) {
       updateStatus('Heal Request Failed');
+    } finally {
+      // Release processing lock immediately after API response
+      state.isProcessing = false;
     }
-    setTimeout(() => { state.isProcessing = false; }, 800);
   }
 
   function toggleActive(val) {
