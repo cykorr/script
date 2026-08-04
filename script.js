@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      4.8
+// @version      4.9
 // @description  Automated hospital healer using Torn API v2 with precise DOM parsing and double-fire prevention.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/item.php*
+// @noframes
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
@@ -13,6 +14,13 @@
 
 (function () {
   'use strict';
+
+  // Prevent double-firing across embedded iframe contexts
+  if (window.top !== window.self) return;
+
+  // Prevent double-firing within the same window context
+  if (window.__AUTO_HEALER_INITIALIZED__) return;
+  window.__AUTO_HEALER_INITIALIZED__ = true;
 
   if (!window.location.pathname.endsWith('/item.php')) return;
 
@@ -138,7 +146,7 @@
       drugItems.forEach(item => {
         const id = parseInt(item.id, 10);
         const qty = parseInt(item.amount || 0, 10);
-        if (id === 206) xanax += qty;         // Xanax
+        if (id === 206) xanax += qty;          // Xanax
       });
 
       inventoryCache = { lastFetch: now, smallAid, firstAid, xanax };
@@ -395,6 +403,16 @@
     setInterval(() => fetchItemCounts(), CONFIG.API_CHECK_INTERVAL_MS);
   }
 
-  if (document.body) init();
-  else window.addEventListener('DOMContentLoaded', init);
+  let hasInitialized = false;
+  function safeInit() {
+    if (hasInitialized) return;
+    hasInitialized = true;
+    init();
+  }
+
+  if (document.readyState === 'interactive' || document.readyState === 'complete') {
+    safeInit();
+  } else {
+    window.addEventListener('DOMContentLoaded', safeInit, { once: true });
+  }
 })();
