@@ -1,10 +1,9 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      4.3
-// @description  Automated hospital healer using Torn API v2 with locally stored item counts.
+// @version      4.4
+// @description  Automated hospital healer using Torn API v2 with locally stored item counts. Runs exclusively on item.php page.
 // @author       arhi [4392583]
-// @match        https://www.torn.com/*
 // @match        https://www.torn.com/item.php*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -14,6 +13,9 @@
 
 (function () {
   'use strict';
+
+  // Strict page guard: ensure code only runs on item.php
+  if (!window.location.pathname.endsWith('/item.php')) return;
 
   const CONFIG = {
     DOM_CHECK_INTERVAL_MS: 500,
@@ -34,11 +36,11 @@
   };
 
   // Cache initialized directly from local storage
-  let inventoryCache = {
-    lastFetch: 0,
-    smallAid: GM_getValue('autoHeal_smallAid', 0),
-    firstAid: GM_getValue('autoHeal_firstAid', 0),
-    xanax: GM_getValue('autoHeal_xanax', 0)
+  let inventoryCache = { 
+    lastFetch: 0, 
+    smallAid: GM_getValue('autoHeal_smallAid', 0), 
+    firstAid: GM_getValue('autoHeal_firstAid', 0), 
+    xanax: GM_getValue('autoHeal_xanax', 0) 
   };
 
   const getCookie = (name) =>
@@ -52,7 +54,7 @@
   }
 
   function getCurrentEnergy() {
-    const elem = document.querySelector('#user-bar #energyval') ||
+    const elem = document.querySelector('#user-bar #energyval') || 
                  document.querySelector('[class*="energy"] [class*="value"]') ||
                  document.querySelector('#barEnergy .val');
     return elem ? parseInt(elem.textContent.match(/\d+/)?.[0] || 0, 10) : null;
@@ -74,7 +76,7 @@
         method: 'GET',
         url,
         onload: (res) => {
-          try { resolve(JSON.parse(res.responseText)); }
+          try { resolve(JSON.parse(res.responseText)); } 
           catch (e) { reject(e); }
         },
         onerror: reject
