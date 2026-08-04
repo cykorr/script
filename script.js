@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      4.6
-// @description  Automated hospital healer using Torn API v2 with instant zero-cooldown response tracking.
+// @version      4.7
+// @description  Automated hospital healer using Torn API v2 with server sync locking.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/item.php*
 // @grant        GM_getValue
@@ -17,8 +17,9 @@
   if (!window.location.pathname.endsWith('/item.php')) return;
 
   const CONFIG = {
-    DOM_CHECK_INTERVAL_MS: 200, // Reduced to 200ms for faster detection
+    DOM_CHECK_INTERVAL_MS: 300,
     API_CHECK_INTERVAL_MS: 5000,
+    SERVER_SYNC_DELAY_MS: 1200, // Waits 1.2s for Torn's server state to update before allowing another heal
     THRESHOLD_SECONDS: 1203,
     MAX_HOSPITAL_SECONDS: 3600
   };
@@ -30,8 +31,6 @@
     apiKey: GM_getValue('autoHeal_apiKey', ''),
     completedCount: GM_getValue('autoHeal_completedCount', 0),
     isProcessing: false,
-    predictedHospSeconds: 0,
-    lastDomUpdateSec: 0,
     posX: GM_getValue('autoHeal_posX', null),
     posY: GM_getValue('autoHeal_posY', null)
   };
@@ -152,7 +151,6 @@
                      document.querySelector('a[href*="hospital"]');
 
     if (!hospLink) {
-      state.predictedHospSeconds = 0;
       updateStatus('Not in Hospital');
       return;
     }
@@ -173,27 +171,14 @@
 
     if (!timerMatch) return;
 
-    let domSec = 0;
+    let hospitalSeconds = 0;
     if (timerMatch.length === 4) {
-      domSec = (parseInt(timerMatch[1], 10) * 3600) + (parseInt(timerMatch[2], 10) * 60) + parseInt(timerMatch[3], 10);
+      hospitalSeconds = (parseInt(timerMatch[1], 10) * 3600) + (parseInt(timerMatch[2], 10) * 60) + parseInt(timerMatch[3], 10);
     } else if (timerMatch.length === 3) {
-      domSec = (parseInt(timerMatch[1], 10) * 60) + parseInt(timerMatch[2], 10);
+      hospitalSeconds = (parseInt(timerMatch[1], 10) * 60) + parseInt(timerMatch[2], 10);
     }
 
-    // Sync state if DOM updated to a smaller value or reset
-    if (domSec < state.lastDomUpdateSec || state.predictedHospSeconds === 0) {
-      state.predictedHospSeconds = domSec;
-    }
-    state.lastDomUpdateSec = domSec;
-
-    const currentHospSeconds = Math.min(domSec, state.predictedHospSeconds);
-
-    if (currentHospSeconds <= 0) {
-      updateStatus('Out of Hospital');
-      return;
-    }
-
-    if (currentHospSeconds > CONFIG.MAX_HOSPITAL_SECONDS) {
+    if (hospitalSeconds > CONFIG.MAX_HOSPITAL_SECONDS) {
       updateStatus('Hospital > 1hr (Skipped)');
       return;
     }
@@ -212,21 +197,17 @@
         }
       } catch (err) {
         updateStatus('Xanax Request Failed');
-      } finally {
-        state.isProcessing = false;
       }
+      setTimeout(() => { state.isProcessing = false; }, CONFIG.SERVER_SYNC_DELAY_MS);
       return;
     }
 
-    const itemId = (currentHospSeconds <= CONFIG.THRESHOLD_SECONDS) ? "68" : "67";
-    const estimatedReduction = itemId === "68" ? 900 : 1800; // ~15 mins or ~30 mins estimation guard
+    const itemId = (hospitalSeconds <= CONFIG.THRESHOLD_SECONDS) ? "68" : "67";
     updateStatus(`Healing (${itemId === "68" ? 'Small Aid' : 'First Aid'})...`);
 
     try {
       const res = await useItemRequest(itemId, rfcToken);
       if (res.success) {
-        // Instantly reduce local prediction so we don't double fire before DOM updates
-        state.predictedHospSeconds = Math.max(0, currentHospSeconds - estimatedReduction);
         state.completedCount += 1;
         GM_setValue('autoHeal_completedCount', state.completedCount);
         fetchItemCounts(true);
@@ -236,10 +217,10 @@
       }
     } catch (err) {
       updateStatus('Heal Request Failed');
-    } finally {
-      // Release processing lock immediately after API response
-      state.isProcessing = false;
     }
+
+    // Keep processing locked long enough to prevent double-sends while Torn backend synchronizes
+    setTimeout(() => { state.isProcessing = false; }, CONFIG.SERVER_SYNC_DELAY_MS);
   }
 
   function toggleActive(val) {
