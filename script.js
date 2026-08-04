@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn - Auto Medical Item Healer
 // @namespace    http://tampermonkey.net/
-// @version      4.1
-// @description  Automated hospital healer and Xanax manager using Torn API v2.
+// @version      4.3
+// @description  Automated hospital healer using Torn API v2 with locally stored item counts.
 // @author       arhi [4392583]
 // @match        https://www.torn.com/*
 // @match        https://www.torn.com/item.php*
@@ -33,7 +33,13 @@
     posY: GM_getValue('autoHeal_posY', null)
   };
 
-  let inventoryCache = { lastFetch: 0, smallAid: 0, firstAid: 0, xanax: 0 };
+  // Cache initialized directly from local storage
+  let inventoryCache = {
+    lastFetch: 0,
+    smallAid: GM_getValue('autoHeal_smallAid', 0),
+    firstAid: GM_getValue('autoHeal_firstAid', 0),
+    xanax: GM_getValue('autoHeal_xanax', 0)
+  };
 
   const getCookie = (name) =>
     document.cookie.split('; ').find(row => row.startsWith(`${name}=`))?.split('=')[1];
@@ -46,7 +52,7 @@
   }
 
   function getCurrentEnergy() {
-    const elem = document.querySelector('#user-bar #energyval') || 
+    const elem = document.querySelector('#user-bar #energyval') ||
                  document.querySelector('[class*="energy"] [class*="value"]') ||
                  document.querySelector('#barEnergy .val');
     return elem ? parseInt(elem.textContent.match(/\d+/)?.[0] || 0, 10) : null;
@@ -68,7 +74,7 @@
         method: 'GET',
         url,
         onload: (res) => {
-          try { resolve(JSON.parse(res.responseText)); } 
+          try { resolve(JSON.parse(res.responseText)); }
           catch (e) { reject(e); }
         },
         onerror: reject
@@ -82,27 +88,42 @@
     if (!state.apiKey) return;
 
     try {
-      // API v2 Inventory call
-      const data = await fetchApiGM(`https://api.torn.com/v2/user/inventory?key=${state.apiKey}`);
-      
-      if (data.error) {
-        updateStatus(`API Error: ${data.error.error || data.error.code}`);
+      const [medData, drugData] = await Promise.all([
+        fetchApiGM(`https://api.torn.com/v2/user/inventory?cat=Medical&key=${state.apiKey}`),
+        fetchApiGM(`https://api.torn.com/v2/user/inventory?cat=Drug&key=${state.apiKey}`)
+      ]);
+
+      if (medData.error || drugData.error) {
+        const err = medData.error || drugData.error;
+        updateStatus(`API Error: ${err.error || err.code}`);
         return;
       }
 
       let smallAid = 0, firstAid = 0, xanax = 0;
-      const items = data?.inventory?.items || [];
+      const medItems = medData?.inventory?.items || [];
+      const drugItems = drugData?.inventory?.items || [];
 
-      items.forEach(item => {
+      medItems.forEach(item => {
         const id = parseInt(item.id, 10);
         const qty = parseInt(item.amount || 0, 10);
-
         if (id === 68) smallAid += qty;       // Small First Aid Kit
         else if (id === 67) firstAid += qty;  // First Aid Kit
-        else if (id === 206) xanax += qty;    // Xanax
       });
 
+      drugItems.forEach(item => {
+        const id = parseInt(item.id, 10);
+        const qty = parseInt(item.amount || 0, 10);
+        if (id === 206) xanax += qty;         // Xanax
+      });
+
+      // Update memory cache
       inventoryCache = { lastFetch: now, smallAid, firstAid, xanax };
+
+      // Save counts to local storage
+      GM_setValue('autoHeal_smallAid', smallAid);
+      GM_setValue('autoHeal_firstAid', firstAid);
+      GM_setValue('autoHeal_xanax', xanax);
+
       updateDashboardCounts(smallAid, firstAid, xanax);
     } catch (err) {
       updateStatus('API Fetch Failed');
@@ -242,9 +263,9 @@
       </div>
 
       <div style="background: #181818; border: 1px solid #333; border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; font-size: 11px;">
-        <div style="display: flex; justify-content: space-between; margin-bottom: 3px;"><span>Small First Aid:</span><strong id="auto-heal-small-aid" style="color: #ff9800;">0</strong></div>
-        <div style="display: flex; justify-content: space-between; margin-bottom: 3px;"><span>First Aid Kit:</span><strong id="auto-heal-first-aid" style="color: #2196f3;">0</strong></div>
-        <div style="display: flex; justify-content: space-between;"><span>Xanax:</span><strong id="auto-heal-xanax-count" style="color: #e91e63;">0</strong></div>
+        <div style="display: flex; justify-content: space-between; margin-bottom: 3px;"><span>Small First Aid:</span><strong id="auto-heal-small-aid" style="color: #ff9800;">${inventoryCache.smallAid}</strong></div>
+        <div style="display: flex; justify-content: space-between; margin-bottom: 3px;"><span>First Aid Kit:</span><strong id="auto-heal-first-aid" style="color: #2196f3;">${inventoryCache.firstAid}</strong></div>
+        <div style="display: flex; justify-content: space-between;"><span>Xanax:</span><strong id="auto-heal-xanax-count" style="color: #e91e63;">${inventoryCache.xanax}</strong></div>
       </div>
 
       <div style="margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
