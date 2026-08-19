@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Auto Xanax & Train (Page Swap & Auto Train)
+// @name         Torn - Auto Xanax & Train (Page Swap & Auto Train)
 // @namespace    http://tampermonkey.net/
-// @version      1.6
-// @description  Automated Xanax user. Swaps to gym page when energy >= 150 or Xanax used, auto-trains chosen stat, then swaps back at 0 energy.
+// @version      1.8
+// @description  Automated Xanax user. Swaps to gym page when energy >= 150 or Xanax used, clicks the gym train button, then swaps back at 0 energy.
 // @author       arhi
 // @match        https://www.torn.com/item.php*
 // @match        https://www.torn.com/gym.php*
@@ -38,7 +38,7 @@
       indicator.innerHTML = `<div style="position:fixed; top:10px; left:50%; transform:translateX(-50%); background:#e91e63; color:#fff; padding:6px 20px; border-radius:6px; z-index:999999; font-weight:bold; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border: 2px solid #fff;">Auto-Gym Active: Training ${statToTrain}...</div>`;
       document.body.appendChild(indicator);
 
-      async function executeTrainRequest() {
+      function executeTrainClick() {
         const energy = getCurrentEnergy();
         
         // If energy is already 0, we are done. Return to Items.
@@ -48,31 +48,44 @@
           return;
         }
 
-        const rfcToken = getCookie('rfc_v') || getCookie('rfc_id');
-        if (!rfcToken) return; // Wait for token to be ready
+        // Search for the train button matching the target stat
+        const targetAriaLabel = `Train ${statToTrain.toLowerCase()}`;
+        const buttons = document.querySelectorAll('button.torn-btn');
+        let trainButton = null;
 
-        try {
-          const body = new URLSearchParams({ step: 'train', stat: statToTrain });
-          await fetch(`/gym.php?step=train&rfcv=${rfcToken}`, {
-            method: 'POST',
-            headers: { 
-              'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 
-              'X-Requested-With': 'XMLHttpRequest' 
-            },
-            body
-          });
-        } catch (e) {
-          console.error('Auto-Gym fetch error:', e);
+        for (const btn of buttons) {
+          const ariaLabel = btn.getAttribute('aria-label');
+          if (ariaLabel && ariaLabel.toLowerCase() === targetAriaLabel) {
+            trainButton = btn;
+            break;
+          }
+        }
+
+        // Fallback: search by text content if aria-label doesn't match precisely
+        if (!trainButton) {
+          for (const btn of buttons) {
+            if (btn.textContent.trim().toUpperCase() === 'TRAIN' && 
+                btn.closest(`.${statToTrain.toLowerCase()}, [class*="${statToTrain.toLowerCase()}"]`)) {
+              trainButton = btn;
+              break;
+            }
+          }
+        }
+
+        if (trainButton) {
+          trainButton.click();
+        } else {
+          console.warn(`Auto-Gym: Could not find train button for ${statToTrain}`);
         }
 
         // Reload the page to securely update Torn's UI/energy bar and trigger the script again
         setTimeout(() => {
           window.location.reload();
-        }, 1000);
+        }, 1500);
       }
 
-      // Wait 1.5 seconds upon landing on the gym page before firing the request to simulate human delay
-      setTimeout(executeTrainRequest, 1500);
+      // Wait 2 seconds upon landing on the gym page to allow elements to load fully before clicking
+      setTimeout(executeTrainClick, 2000);
     }
     
     // Stop the rest of the script from running on the gym page
@@ -285,7 +298,6 @@
 
     document.getElementById('auto-xanax-toggle-btn').addEventListener('click', () => toggleActive(!state.active));
     
-    // Bind Test Swap button
     document.getElementById('auto-xanax-test-swap-btn').addEventListener('click', () => {
       GM_setValue('autoXanax_pendingGym', true);
       window.location.href = '/gym.php';
